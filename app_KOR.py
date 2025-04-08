@@ -26,18 +26,12 @@ from langchain_core.runnables import RunnableConfig
 # 환경 변수 로드 (.env 파일에서 API 키 등의 설정을 가져옴)
 load_dotenv(override=True)
 
-# 페이지 설정: 제목, 아이콘, 레이아웃 구성
 st.set_page_config(page_title="Agent with MCP Tools", page_icon="🧠", layout="wide")
-
-# 사이드바 상단에 저자 정보 추가
 st.sidebar.markdown("### ✍️ Made by [TeddyNote](https://youtube.com/c/teddynote) 🚀")
 st.sidebar.divider()
-
-# 메인 페이지 타이틀 및 설명
 st.title("🤖 Agent with MCP Tools")
 st.markdown("✨ MCP 도구를 활용한 ReAct 에이전트에게 질문해보세요.")
 
-# 세션 상태 초기화
 if "session_initialized" not in st.session_state:
     st.session_state.session_initialized = False
     st.session_state.agent = None
@@ -49,27 +43,23 @@ if "thread_id" not in st.session_state:
     st.session_state.thread_id = random_uuid()
 
 # ======================================================================
-# 고정 MCP 서버 접속 정보 (고정 IP: 3.35.28.26, 포트: 8005)
+# 수정: 고정 MCP 서버 접속 정보 - 고정 IP: 3.35.28.26, 포트: 8005, SSE 엔드포인트 "/sse" 추가 
 FIXED_PUBLIC_IP = "3.35.28.26"
 MCP_PORT = "8005"
+SSE_PATH = "/sse"
 # ======================================================================
 
 async def cleanup_mcp_client():
-    """
-    기존 MCP 클라이언트를 안전하게 종료합니다.
-    """
     if "mcp_client" in st.session_state and st.session_state.mcp_client is not None:
         try:
             await st.session_state.mcp_client.__aexit__(None, None, None)
             st.session_state.mcp_client = None
         except Exception as e:
             import traceback
-            # 오류 로그 출력을 원하면 여기에 추가
+            # st.warning(f"Error while closing MCP client: {str(e)}")
+            # st.warning(traceback.format_exc())
 
 def print_message():
-    """
-    채팅 기록을 화면에 출력합니다.
-    """
     i = 0
     while i < len(st.session_state.history):
         message = st.session_state.history[i]
@@ -79,10 +69,12 @@ def print_message():
         elif message["role"] == "assistant":
             with st.chat_message("assistant"):
                 st.markdown(message["content"])
-                if (i + 1 < len(st.session_state.history)
-                    and st.session_state.history[i + 1]["role"] == "assistant_tool"):
+                if (
+                    i+1 < len(st.session_state.history)
+                    and st.session_state.history[i+1]["role"] == "assistant_tool"
+                ):
                     with st.expander("🔧 Tool Call Information", expanded=False):
-                        st.markdown(st.session_state.history[i + 1]["content"])
+                        st.markdown(st.session_state.history[i+1]["content"])
                     i += 2
                 else:
                     i += 1
@@ -90,16 +82,11 @@ def print_message():
             i += 1
 
 def get_streaming_callback(text_placeholder, tool_placeholder):
-    """
-    스트리밍 콜백 함수를 생성합니다.
-    """
     accumulated_text = []
     accumulated_tool = []
-
     def callback_func(message: dict):
         nonlocal accumulated_text, accumulated_tool
         message_content = message.get("content", None)
-
         if isinstance(message_content, AIMessageChunk):
             content = message_content.content
             if isinstance(content, list) and len(content) > 0:
@@ -121,13 +108,9 @@ def get_streaming_callback(text_placeholder, tool_placeholder):
             with tool_placeholder.expander("🔧 Tool Call Information", expanded=True):
                 st.markdown("".join(accumulated_tool))
         return None
-
     return callback_func, accumulated_text, accumulated_tool
 
 async def process_query(query, text_placeholder, tool_placeholder, timeout_seconds=60):
-    """
-    사용자 질문을 처리하고 응답을 생성합니다.
-    """
     try:
         if st.session_state.agent:
             streaming_callback, accumulated_text_obj, accumulated_tool_obj = get_streaming_callback(text_placeholder, tool_placeholder)
@@ -155,18 +138,14 @@ async def process_query(query, text_placeholder, tool_placeholder, timeout_secon
         return {"error": error_msg}, error_msg, ""
 
 async def initialize_session(mcp_config=None):
-    """
-    MCP 세션과 에이전트를 초기화합니다.
-    """
     try:
         with st.spinner("🔄 Connecting to MCP server..."):
-            # 기존 MCP 클라이언트 정리
             await cleanup_mcp_client()
             if mcp_config is None:
-                # 고정 IP를 사용하여 MCP 설정 구성
+                # 수정: 고정 IP와 "/sse" 엔드포인트를 적용한 MCP 설정 구성
                 mcp_config = {
                     "weather": {
-                        "url": f"http://{FIXED_PUBLIC_IP}:{MCP_PORT}",
+                        "url": f"http://{FIXED_PUBLIC_IP}:{MCP_PORT}{SSE_PATH}",
                         "transport": "sse"
                     }
                 }
@@ -198,13 +177,13 @@ async def initialize_session(mcp_config=None):
 
 # --- Sidebar UI: MCP Tool Addition Interface ---
 with st.sidebar.expander("Add MCP Tools", expanded=False):
+    # 수정: Sidebar 기본 설정에서 URL도 "/sse"가 적용되도록 수정
     default_config = """{
   "weather": {
-    "url": "http://3.35.28.196:8005",
+    "url": "http://3.35.28.26:8005/sse",
     "transport": "sse"
   }
 }"""
-    # 고정 IP 설정은 위가 기본값; 필요 시, 세션에 저장된 값 사용
     if "pending_mcp_config" not in st.session_state:
         try:
             st.session_state.pending_mcp_config = json.loads(
@@ -240,7 +219,7 @@ with st.sidebar.expander("Add MCP Tools", expanded=False):
                 "run",
                 "@smithery-ai/github",
                 "--config",
-                '{"githubPersonalAccessToken":"your_token_here"}',
+                '{"githubPersonalAccessToken":"your_token_here"}'
             ],
             "transport": "stdio",
         }
@@ -285,7 +264,7 @@ with st.sidebar.expander("Add MCP Tools", expanded=False):
                             success_tools.append(tool_name)
                     if success_tools:
                         if len(success_tools) == 1:
-                            st.success(f"{success_tools[0]} tool has been added. Press 'Apply' button to apply changes.")
+                            st.success(f"{success_tools[0]} tool has been added. Press 'Apply' to apply changes.")
                         else:
                             tool_names = ", ".join(success_tools)
                             st.success(f"Total {len(success_tools)} tools ({tool_names}) have been added. Press 'Apply' to apply changes.")
@@ -295,8 +274,8 @@ with st.sidebar.expander("Add MCP Tools", expanded=False):
                 """
             **How to fix**:
             1. Check the JSON format.
-            2. All keys and string values must be wrapped in double quotes.
-            3. Escape double quotes within strings.
+            2. All keys and strings must be enclosed in double quotes.
+            3. Escape double quotes within strings if necessary.
             """
             )
         except Exception as e:
