@@ -4,7 +4,6 @@ import streamlit as st
 import asyncio
 import nest_asyncio
 import json
-import requests  # HTTP 요청을 위한 모듈
 
 nest_asyncio.apply()
 
@@ -24,10 +23,10 @@ from langchain_core.messages.tool import ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig
 
-# 환경 변수 로드 (.env 파일 등, API 키 포함)
+# 환경 변수 로드 (.env 파일 등)
 load_dotenv(override=True)
 
-# 페이지 설정
+# 스트림릿 페이지 설정
 st.set_page_config(page_title="Agent with MCP Tools", page_icon="🧠", layout="wide")
 st.sidebar.markdown("### ✍️ Made by [테디노트](https://youtube.com/c/teddynote) 🚀")
 st.sidebar.divider()
@@ -45,41 +44,19 @@ if "session_initialized" not in st.session_state:
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = random_uuid()
 
-
-### 1. 인스턴스 메타데이터 API를 통한 공인 IP 조회 함수
-
-def get_public_ip():
-    """
-    EC2 인스턴스 메타데이터 API를 통해 동적으로 공인 IP를 조회합니다.
-    반환값: 공인 IP 문자열 (조회 실패 시 None)
-    """
-    try:
-        metadata_url = "http://169.254.169.254/latest/meta-data/public-ipv4"
-        response = requests.get(metadata_url, timeout=1)
-        if response.status_code == 200:
-            return response.text.strip()
-        else:
-            print(f"메타데이터 응답 코드: {response.status_code}")
-    except Exception as e:
-        print(f"공인 IP 조회 예외 발생: {e}")
-    return None
-
-
-### 2. MCP 초기화 함수 수정 (동적 IP 적용)
+# 고정된 MCP 서버 접속 정보 (고정 IP: 3.35.28.26, 포트: 8005)
+FIXED_PUBLIC_IP = "3.35.28.26"
+MCP_PORT = "8005"
 
 async def initialize_session(mcp_config=None):
     try:
-        with st.spinner("🔄 MCP 서버에 연결 중..."):
+        with st.spinner("🔄 MCP 서버와 에이전트를 초기화합니다. 잠시만 기다려주세요..."):
             await cleanup_mcp_client()
             if mcp_config is None:
-                # 동적 공인 IP 조회
-                public_ip = get_public_ip()
-                if public_ip is None:
-                    raise Exception("EC2 인스턴스의 공인 IP를 조회할 수 없습니다.")
-                # 포트 8005는 고정, 공인 IP는 동적으로 가져옴
+                # 고정 IP를 사용하여 MCP 설정 구성
                 mcp_config = {
                     "weather": {
-                        "url": f"http://{public_ip}:8005",
+                        "url": f"http://{FIXED_PUBLIC_IP}:{MCP_PORT}",
                         "transport": "sse"
                     }
                 }
@@ -109,8 +86,6 @@ async def initialize_session(mcp_config=None):
         st.error(traceback.format_exc())
         return False
 
-
-### 기타 기존 함수들은 그대로 유지
 async def cleanup_mcp_client():
     if "mcp_client" in st.session_state and st.session_state.mcp_client is not None:
         try:
@@ -118,6 +93,8 @@ async def cleanup_mcp_client():
             st.session_state.mcp_client = None
         except Exception as e:
             import traceback
+            # 선택: 오류 로깅
+            print("MCP 클라이언트 종료 오류:", e)
 
 def print_message():
     i = 0
@@ -194,18 +171,20 @@ async def process_query(query, text_placeholder, tool_placeholder, timeout_secon
         error_msg = f"❌ 쿼리 처리 중 오류 발생: {str(e)}\n{traceback.format_exc()}"
         return {"error": error_msg}, error_msg, ""
 
-# --- 사이드바 UI 등 나머지 코드는 기존 구조를 유지합니다 ---
+# --- 사이드바 UI: MCP 도구 추가 및 설정 적용
 
 with st.sidebar.expander("MCP 도구 추가", expanded=False):
     default_config = """{
   "weather": {
-    "url": "http://43.200.183.196:8005",
+    "url": "http://3.35.28.26:8005",
     "transport": "sse"
   }
 }"""
     if "pending_mcp_config" not in st.session_state:
         try:
-            st.session_state.pending_mcp_config = json.loads(st.session_state.get("mcp_config_text", default_config))
+            st.session_state.pending_mcp_config = json.loads(
+                st.session_state.get("mcp_config_text", default_config)
+            )
         except Exception as e:
             st.error(f"초기 pending config 설정 실패: {e}")
     st.subheader("개별 도구 추가")
