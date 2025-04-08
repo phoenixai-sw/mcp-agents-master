@@ -1,7 +1,10 @@
+# 파일명: app_KOR.py
+
 import streamlit as st
 import asyncio
 import nest_asyncio
 import json
+import requests  # HTTP 요청을 위한 모듈
 
 nest_asyncio.apply()
 
@@ -21,14 +24,17 @@ from langchain_core.messages.tool import ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig
 
+# 환경 변수 로드 (.env 파일 등, API 키 포함)
 load_dotenv(override=True)
 
+# 페이지 설정
 st.set_page_config(page_title="Agent with MCP Tools", page_icon="🧠", layout="wide")
 st.sidebar.markdown("### ✍️ Made by [테디노트](https://youtube.com/c/teddynote) 🚀")
 st.sidebar.divider()
 st.title("🤖 Agent with MCP Tools")
 st.markdown("✨ MCP 도구를 활용한 ReAct 에이전트에게 질문해보세요.")
 
+# 세션 상태 초기화
 if "session_initialized" not in st.session_state:
     st.session_state.session_initialized = False
     st.session_state.agent = None
@@ -40,8 +46,71 @@ if "thread_id" not in st.session_state:
     st.session_state.thread_id = random_uuid()
 
 
-# --- 함수 정의 ---
+### 1. 인스턴스 메타데이터 API를 통한 공인 IP 조회 함수
 
+def get_public_ip():
+    """
+    EC2 인스턴스 메타데이터 API를 통해 동적으로 공인 IP를 조회합니다.
+    반환값: 공인 IP 문자열 (조회 실패 시 None)
+    """
+    try:
+        metadata_url = "http://169.254.169.254/latest/meta-data/public-ipv4"
+        response = requests.get(metadata_url, timeout=1)
+        if response.status_code == 200:
+            return response.text.strip()
+        else:
+            print(f"메타데이터 응답 코드: {response.status_code}")
+    except Exception as e:
+        print(f"공인 IP 조회 예외 발생: {e}")
+    return None
+
+
+### 2. MCP 초기화 함수 수정 (동적 IP 적용)
+
+async def initialize_session(mcp_config=None):
+    try:
+        with st.spinner("🔄 MCP 서버에 연결 중..."):
+            await cleanup_mcp_client()
+            if mcp_config is None:
+                # 동적 공인 IP 조회
+                public_ip = get_public_ip()
+                if public_ip is None:
+                    raise Exception("EC2 인스턴스의 공인 IP를 조회할 수 없습니다.")
+                # 포트 8005는 고정, 공인 IP는 동적으로 가져옴
+                mcp_config = {
+                    "weather": {
+                        "url": f"http://{public_ip}:8005",
+                        "transport": "sse"
+                    }
+                }
+            client = MultiServerMCPClient(mcp_config)
+            await client.__aenter__()
+            tools = client.get_tools()
+            st.session_state.tool_count = len(tools)
+            st.session_state.mcp_client = client
+
+            model = ChatAnthropic(
+                model="claude-3-7-sonnet-latest",
+                temperature=0.1,
+                max_tokens=20000
+            )
+            agent = create_react_agent(
+                model,
+                tools,
+                checkpointer=MemorySaver(),
+                prompt="Use your tools to answer the question. Answer in Korean.",
+            )
+            st.session_state.agent = agent
+            st.session_state.session_initialized = True
+            return True
+    except Exception as e:
+        st.error(f"❌ 초기화 중 오류 발생: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
+        return False
+
+
+### 기타 기존 함수들은 그대로 유지
 async def cleanup_mcp_client():
     if "mcp_client" in st.session_state and st.session_state.mcp_client is not None:
         try:
@@ -49,9 +118,6 @@ async def cleanup_mcp_client():
             st.session_state.mcp_client = None
         except Exception as e:
             import traceback
-            # (옵션) 오류 로그 출력
-            # st.warning(f"MCP 클라이언트 종료 중 오류: {str(e)}")
-            # st.warning(traceback.format_exc())
 
 def print_message():
     i = 0
@@ -128,45 +194,7 @@ async def process_query(query, text_placeholder, tool_placeholder, timeout_secon
         error_msg = f"❌ 쿼리 처리 중 오류 발생: {str(e)}\n{traceback.format_exc()}"
         return {"error": error_msg}, error_msg, ""
 
-async def initialize_session(mcp_config=None):
-    try:
-        with st.spinner("🔄 MCP 서버에 연결 중..."):
-            await cleanup_mcp_client()
-            if mcp_config is None:
-                # AWS EC2에 배포된 원격 MCP 서버 설정 적용
-                mcp_config = {
-                    "weather": {
-                        "url": "http://15.164.99.164:8005",  # EC2 공인 IP와 포트 8005 사용
-                        "transport": "sse"
-                    }
-                }
-            client = MultiServerMCPClient(mcp_config)
-            await client.__aenter__()
-            tools = client.get_tools()
-            st.session_state.tool_count = len(tools)
-            st.session_state.mcp_client = client
-
-            model = ChatAnthropic(
-                model="claude-3-7-sonnet-latest",
-                temperature=0.1,
-                max_tokens=20000
-            )
-            agent = create_react_agent(
-                model,
-                tools,
-                checkpointer=MemorySaver(),
-                prompt="Use your tools to answer the question. Answer in Korean.",
-            )
-            st.session_state.agent = agent
-            st.session_state.session_initialized = True
-            return True
-    except Exception as e:
-        st.error(f"❌ 초기화 중 오류 발생: {str(e)}")
-        import traceback
-        st.error(traceback.format_exc())
-        return False
-
-# --- 사이드바 UI: MCP 도구 추가 ---
+# --- 사이드바 UI 등 나머지 코드는 기존 구조를 유지합니다 ---
 
 with st.sidebar.expander("MCP 도구 추가", expanded=False):
     default_config = """{
@@ -239,17 +267,6 @@ with st.sidebar.expander("MCP 도구 추가", expanded=False):
                         else:
                             tool_names = ", ".join(success_tools)
                             st.success(f"총 {len(success_tools)}개 도구({tool_names})가 추가되었습니다. 적용하려면 '적용하기' 버튼을 눌러주세요.")
-        except json.JSONDecodeError as e:
-            st.error(f"JSON 파싱 에러: {e}")
-            st.markdown(
-                """
-                **수정 방법**:
-                1. JSON 형식이 올바른지 확인하세요.
-                2. 모든 키는 큰따옴표(")로 감싸야 합니다.
-                3. 문자열 값도 큰따옴표(")로 감싸야 합니다.
-                4. 문자열 내 큰따옴표는 이스케이프(\\") 처리해야 합니다.
-                """
-            )
         except Exception as e:
             st.error(f"오류 발생: {e}")
     st.divider()
