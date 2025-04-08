@@ -199,7 +199,7 @@ async def process_query(query, text_placeholder, tool_placeholder, timeout_secon
 with st.sidebar.expander("MCP 도구 추가", expanded=False):
     default_config = """{
   "weather": {
-    "url": "http://15.164.99.164:8005",
+    "url": "http://43.200.183.196:8005",
     "transport": "sse"
   }
 }"""
