@@ -2,6 +2,7 @@ import streamlit as st
 import asyncio
 import nest_asyncio
 import json
+import os
 
 # nest_asyncio 적용: 이미 실행 중인 이벤트 루프 내에서 중첩 호출 허용
 nest_asyncio.apply()
@@ -15,13 +16,6 @@ if "event_loop" not in st.session_state:
 from langgraph.prebuilt import create_react_agent
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
-try:
-    from langchain_vertexai import ChatVertexAI
-except ImportError:
-    try:
-        from langchain.chat_models import ChatVertexAI
-    except ImportError:
-        ChatVertexAI = None
 from langchain_core.messages import HumanMessage
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -37,21 +31,36 @@ load_dotenv(override=True)
 # 페이지 설정: 제목, 아이콘, 레이아웃 구성
 st.set_page_config(page_title="Agent with MCP Tools", page_icon="🧠", layout="wide")
 
-# 사이드바 최상단에 저자 정보 추가 (다른 사이드바 요소보다 먼저 배치)
+# 사이드바 최상단에 저자 정보 추가
 st.sidebar.markdown("### ✍️ Made by [테디노트](https://youtube.com/c/teddynote) 🚀")
 st.sidebar.divider()  # 구분선 추가
 
-# 기존 페이지 타이틀 및 설명
+# --- 사이드바: LLM 모델 선택 ---
+model_options = ["claude 3.7sonnet", "gpt-4o", "gemini-2.0", "Grok3", "Llamma3.3", "phoenix-1.0"]
+selected_model = st.sidebar.selectbox("LLM 모델 선택", model_options, index=0, key="model_choice")
+# 지원되지 않는 모델에 대한 경고 메시지 표시
+if selected_model not in ["claude 3.7sonnet", "gpt-4o"]:
+    st.sidebar.warning("⚠️ 선택한 모델은 현재 지원되지 않습니다. Claude 3.7sonnet 또는 GPT-4o만 사용 가능합니다.")
+# 모델 선택 변경 시 세션 재초기화
+if "current_model" not in st.session_state:
+    st.session_state.current_model = selected_model
+elif st.session_state.current_model != selected_model:
+    st.session_state.current_model = selected_model
+    st.session_state.session_initialized = False
+    st.session_state.agent = None
+    st.session_state.mcp_client = None
+
+# 기존 페이지 제목 및 설명
 st.title("🤖 Agent with MCP Tools")
 st.markdown("✨ MCP 도구를 활용한 ReAct 에이전트에게 질문해보세요.")
 
 # 세션 상태 초기화
 if "session_initialized" not in st.session_state:
-    st.session_state.session_initialized = False  # 세션 초기화 상태 플래그
-    st.session_state.agent = None  # ReAct 에이전트 객체 저장 공간
-    st.session_state.history = []  # 대화 기록 저장 리스트
-    st.session_state.mcp_client = None  # MCP 클라이언트 객체 저장 공간
-    st.session_state.timeout_seconds = 120  # 응답 생성 제한 시간(초), 기본값 120초
+    st.session_state.session_initialized = False
+    st.session_state.agent = None
+    st.session_state.history = []
+    st.session_state.mcp_client = None
+    st.session_state.timeout_seconds = 120  # 응답 생성 제한 시간(초)
 
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = random_uuid()
@@ -59,27 +68,17 @@ if "thread_id" not in st.session_state:
 # --- 함수 정의 부분 ---
 
 async def cleanup_mcp_client():
-    """
-    기존 MCP 클라이언트를 안전하게 종료합니다.
-
-    기존 클라이언트가 있는 경우 정상적으로 리소스를 해제합니다.
-    """
+    """기존 MCP 클라이언트를 안전하게 종료합니다."""
     if "mcp_client" in st.session_state and st.session_state.mcp_client is not None:
         try:
             await st.session_state.mcp_client.__aexit__(None, None, None)
             st.session_state.mcp_client = None
-        except Exception as e:
-            import traceback
-            # st.warning(f"MCP 클라이언트 종료 중 오류: {str(e)}")
-            # st.warning(traceback.format_exc())
+        except Exception:
+            # MCP 클라이언트 종료 중 발생한 오류는 무시 (필요 시 로그 처리 가능)
+            pass
 
 def print_message():
-    """
-    채팅 기록을 화면에 출력합니다.
-
-    사용자와 어시스턴트의 메시지를 구분하여 화면에 표시하고,
-    도구 호출 정보는 어시스턴트 메시지 컨테이너 내에 표시합니다.
-    """
+    """현재까지의 대화 기록을 화면에 출력합니다."""
     i = 0
     while i < len(st.session_state.history):
         message = st.session_state.history[i]
@@ -87,63 +86,53 @@ def print_message():
             st.chat_message("user").markdown(message["content"])
             i += 1
         elif message["role"] == "assistant":
+            # Assistant 메시지 출력 컨테이너 생성
             with st.chat_message("assistant"):
                 st.markdown(message["content"])
-                if (
-                    i + 1 < len(st.session_state.history)
-                    and st.session_state.history[i + 1]["role"] == "assistant_tool"
-                ):
+                # 바로 다음 메시지가 도구 호출 정보인지 확인
+                if i + 1 < len(st.session_state.history) and st.session_state.history[i + 1]["role"] == "assistant_tool":
+                    # 도구 호출 정보는 expander로 같은 컨테이너 내에 표시
                     with st.expander("🔧 도구 호출 정보", expanded=False):
                         st.markdown(st.session_state.history[i + 1]["content"])
-                    i += 2  # 두 메시지를 함께 처리했으므로 2 증가
+                    i += 2  # 메시지 2개(user 질문+tool 정보)를 한 번에 처리
                 else:
-                    i += 1  # 일반 메시지만 처리했으므로 1 증가
+                    i += 1
         else:
-            # assistant_tool 메시지는 위에서 처리되므로 건너뜀
+            # "assistant_tool" 역할의 메시지는 위에서 함께 처리하므로 건너뜀
             i += 1
 
 def get_streaming_callback(text_placeholder, tool_placeholder):
     """
-    스트리밍 콜백 함수를 생성합니다.
-
-    매개변수:
-        text_placeholder: 텍스트 응답을 표시할 Streamlit 컴포넌트
-        tool_placeholder: 도구 호출 정보를 표시할 Streamlit 컴포넌트
-
-    반환값:
-        callback_func: 스트리밍 콜백 함수
-        accumulated_text: 누적된 텍스트 응답을 저장하는 리스트
-        accumulated_tool: 누적된 도구 호출 정보를 저장하는 리스트
+    스트리밍 응답 생성을 처리하는 콜백 함수를 생성합니다.
+    - text_placeholder: 실시간 생성되는 텍스트 응답 표시용
+    - tool_placeholder: 실시간 생성되는 도구 호출 정보 표시용
     """
     accumulated_text = []
     accumulated_tool = []
 
     def callback_func(message: dict):
         nonlocal accumulated_text, accumulated_tool
-        message_content = message.get("content", None)
-
-        if isinstance(message_content, AIMessageChunk):
-            content = message_content.content
-            if isinstance(content, list) and len(content) > 0:
-                message_chunk = content[0]
-                if message_chunk["type"] == "text":
-                    accumulated_text.append(message_chunk["text"])
+        content = message.get("content", None)
+        if isinstance(content, AIMessageChunk):
+            chunk = content.content
+            if isinstance(chunk, list) and len(chunk) > 0:
+                part = chunk[0]
+                if part["type"] == "text":
+                    # 텍스트 응답 조각
+                    accumulated_text.append(part["text"])
                     text_placeholder.markdown("".join(accumulated_text))
-                elif message_chunk["type"] == "tool_use":
-                    if "partial_json" in message_chunk:
-                        accumulated_tool.append(message_chunk["partial_json"])
+                elif part["type"] == "tool_use":
+                    # 도구 호출 조각
+                    if "partial_json" in part:
+                        accumulated_tool.append(part["partial_json"])
                     else:
-                        tool_call_chunks = message_content.tool_call_chunks
-                        tool_call_chunk = tool_call_chunks[0]
-                        accumulated_tool.append(
-                            "\n```json\n" + str(tool_call_chunk) + "\n```\n"
-                        )
+                        tool_call_chunk = content.tool_call_chunks[0]
+                        accumulated_tool.append("\n```json\n" + str(tool_call_chunk) + "\n```\n")
                     with tool_placeholder.expander("🔧 도구 호출 정보", expanded=True):
                         st.markdown("".join(accumulated_tool))
-        elif isinstance(message_content, ToolMessage):
-            accumulated_tool.append(
-                "\n```json\n" + str(message_content.content) + "\n```\n"
-            )
+        elif isinstance(content, ToolMessage):
+            # 최종 도구 호출 결과 메시지
+            accumulated_tool.append("\n```json\n" + str(content.content) + "\n```\n")
             with tool_placeholder.expander("🔧 도구 호출 정보", expanded=True):
                 st.markdown("".join(accumulated_tool))
         return None
@@ -151,18 +140,11 @@ def get_streaming_callback(text_placeholder, tool_placeholder):
     return callback_func, accumulated_text, accumulated_tool
 
 async def process_query(query, text_placeholder, tool_placeholder, timeout_seconds=60):
-    """
-    사용자 질문을 처리하고 응답을 생성합니다.
-
-    매개변수:
-        query: 사용자가 입력한 질문 텍스트
-        text_placeholder: 텍스트 응답을 표시할 Streamlit 컴포넌트
-        tool_placeholder: 도구 호출 정보를 표시할 Streamlit 컴포넌트
-        timeout_seconds: 응답 생성 제한 시간(초)
-    """
+    """사용자 질문을 받아 에이전트의 응답을 생성하고 반환합니다."""
     try:
         if st.session_state.agent:
-            streaming_callback, accumulated_text_obj, accumulated_tool_obj = get_streaming_callback(text_placeholder, tool_placeholder)
+            # 스트리밍 콜백 및 누적 버퍼 초기화
+            streaming_callback, accumulated_text, accumulated_tool = get_streaming_callback(text_placeholder, tool_placeholder)
             try:
                 response = await asyncio.wait_for(
                     astream_graph(
@@ -176,68 +158,54 @@ async def process_query(query, text_placeholder, tool_placeholder, timeout_secon
             except asyncio.TimeoutError:
                 error_msg = f"⏱️ 요청 시간이 {timeout_seconds}초를 초과했습니다. 나중에 다시 시도해 주세요."
                 return {"error": error_msg}, error_msg, ""
-            final_text = "".join(accumulated_text_obj)
-            final_tool = "".join(accumulated_tool_obj)
+            # 최종 응답 취합
+            final_text = "".join(accumulated_text)
+            final_tool = "".join(accumulated_tool)
             return response, final_text, final_tool
         else:
-            return (
-                {"error": "🚫 에이전트가 초기화되지 않았습니다."},
-                "🚫 에이전트가 초기화되지 않았습니다.",
-                "",
-            )
+            return ({"error": "🚫 에이전트가 초기화되지 않았습니다."}, "🚫 에이전트가 초기화되지 않았습니다.", "")
     except Exception as e:
         import traceback
-        error_msg = f"❌ 쿼리 처리 중 오류 발생: {str(e)}\n{traceback.format_exc()}"
+        error_msg = f"❌ 쿼리 처리 중 오류 발생: {e}\n{traceback.format_exc()}"
         return {"error": error_msg}, error_msg, ""
 
 async def initialize_session(mcp_config=None):
     """
-    MCP 세션과 에이전트를 초기화합니다.
-
-    매개변수:
-        mcp_config: MCP 도구 설정 정보(JSON). None인 경우 기본 설정 사용
-    반환값:
-        bool: 초기화 성공 여부
+    MCP 클라이언트와 LangChain 에이전트를 초기화합니다.
+    - mcp_config: MCP 도구 설정 (JSON dict). None이면 기본 원격 설정 사용.
+    반환: 초기화 성공(bool)
     """
     try:
         with st.spinner("🔄 MCP 서버에 연결 중..."):
-            # 먼저 기존 클라이언트를 안전하게 정리
+            # 기존 MCP 클라이언트 종료 처리
             await cleanup_mcp_client()
-
             if mcp_config is None:
-                # 기본 설정 사용
+                # 기본 설정: 원격 MCP 서버(SSE) Weather 툴
                 mcp_config = {
                     "weather": {
-                        "command": "python",
-                        "args": ["./mcp_server_local.py"],
-                        "transport": "stdio",
-                    },
+                        "url": "http://3.35.28.26:8005/sse",
+                        "transport": "sse",
+                    }
                 }
+            # MCP 멀티서버 클라이언트 생성 및 접속
             client = MultiServerMCPClient(mcp_config)
             await client.__aenter__()
             tools = client.get_tools()
             st.session_state.tool_count = len(tools)
             st.session_state.mcp_client = client
 
-            selected_model = st.session_state.get("selected_model", "Claude 3.7 Sonnet")
-            if selected_model == "Claude 3.7 Sonnet":
+            # LLM 모델 선택에 따라 적절한 LangChain Chat 객체 생성
+            model_choice = st.session_state.get("model_choice", "claude 3.7sonnet")
+            if model_choice == "claude 3.7sonnet":
                 model = ChatAnthropic(model="claude-3-7-sonnet-latest", temperature=0.1, max_tokens=20000)
-            elif selected_model == "GPT-4o (OpenAI)":
-                model = ChatOpenAI(model="gpt-4", temperature=0.1, max_tokens=20000)
-            elif selected_model == "Gemini 2.0":
-                if ChatVertexAI:
-                    model = ChatVertexAI(model_name="chat-bison-001", temperature=0.1, max_output_tokens=2000)
-                else:
-                    raise Exception("ChatVertexAI integration is not available.")
-            elif selected_model == "Grok 3":
-                model = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.1, max_tokens=20000)
-            elif selected_model == "Llama 3.3":
-                model = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.1, max_tokens=20000)
-            elif selected_model == "Phoenix 1.0":
-                model = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.1, max_tokens=20000)
+            elif model_choice == "gpt-4o":
+                model = ChatOpenAI(model="gpt-4o", temperature=0.1, max_tokens=20000)
             else:
-                model = ChatAnthropic(model="claude-3-7-sonnet-latest", temperature=0.1, max_tokens=20000)
+                # 지원되지 않는 모델인 경우 초기화 실패 처리
+                st.error("🚫 선택한 LLM 모델은 지원되지 않습니다. 다른 모델을 선택해주세요.")
+                return False
 
+            # ReAct 에이전트 생성 (LangGraph)
             agent = create_react_agent(
                 model,
                 tools,
@@ -245,25 +213,23 @@ async def initialize_session(mcp_config=None):
                 prompt="Use your tools to answer the question. Answer in Korean.",
             )
             st.session_state.agent = agent
-            st.session_state.model_in_use = selected_model
             st.session_state.session_initialized = True
             return True
     except Exception as e:
-        st.error(f"❌ 초기화 중 오류 발생: {str(e)}")
+        st.error(f"❌ 초기화 중 오류 발생: {e}")
         import traceback
         st.error(traceback.format_exc())
         return False
 
-# --- 사이드바 UI: MCP 도구 추가 인터페이스 ---
-with st.sidebar.expander("MCP 도구 추가", expanded=False):
+# --- 사이드바: MCP 도구 추가 ---
+with st.sidebar.expander("도구 추가", expanded=False):
     default_config = """{
   "weather": {
-    "command": "python",
-    "args": ["./mcp_server_local.py"],
-    "transport": "stdio"
+    "url": "http://3.35.28.26:8005/sse",
+    "transport": "sse"
   }
 }"""
-    # pending config가 없으면 기존 mcp_config_text 기반으로 생성
+    # session_state에 pending 설정이 없으면 기본값 사용
     if "pending_mcp_config" not in st.session_state:
         try:
             st.session_state.pending_mcp_config = json.loads(
@@ -272,7 +238,6 @@ with st.sidebar.expander("MCP 도구 추가", expanded=False):
         except Exception as e:
             st.error(f"초기 pending config 설정 실패: {e}")
 
-    # 개별 도구 추가를 위한 UI
     st.subheader("개별 도구 추가")
     st.markdown(
         """
@@ -291,7 +256,7 @@ with st.sidebar.expander("MCP 도구 추가", expanded=False):
     """
     )
 
-    # 보다 명확한 예시 제공
+    # 예시 JSON (GitHub 툴 예제)
     example_json = {
         "github": {
             "command": "npx",
@@ -307,228 +272,120 @@ with st.sidebar.expander("MCP 도구 추가", expanded=False):
         }
     }
     default_text = json.dumps(example_json, indent=2, ensure_ascii=False)
+    new_tool_json = st.text_area("도구 JSON", default_text, height=250)
 
-    new_tool_json = st.text_area(
-        "도구 JSON",
-        default_text,
-        height=250,
-    )
-
-    # 추가하기 버튼
-    if st.button(
-        "도구 추가",
-        type="primary",
-        key="add_tool_button",
-        use_container_width=True,
-    ):
+    # "도구 추가" 버튼 처리
+    if st.button("도구 추가", type="primary", key="add_tool_button", use_container_width=True):
         try:
-            # 입력값 검증
+            # JSON 문자열 기본 검증
             if not new_tool_json.strip().startswith("{") or not new_tool_json.strip().endswith("}"):
                 st.error("JSON은 중괄호({})로 시작하고 끝나야 합니다.")
                 st.markdown('올바른 형식: `{ "도구이름": { ... } }`')
             else:
-                # JSON 파싱
                 parsed_tool = json.loads(new_tool_json)
-
-                # mcpServers 형식인지 확인하고 처리
+                # 혹시 최상위에 "mcpServers" 키가 있으면 내부 내용으로 대체
                 if "mcpServers" in parsed_tool:
-                    # mcpServers 안의 내용을 최상위로 이동
                     parsed_tool = parsed_tool["mcpServers"]
-                    st.info("'mcpServers' 형식이 감지되었습니다. 자동으로 변환합니다.")
-
-                # 입력된 도구 수 확인
+                    st.info("'mcpServers' 형식이 감지되어 내부 도구 설정으로 변환했습니다.")
                 if len(parsed_tool) == 0:
-                    st.error("최소 하나 이상의 도구를 입력해주세요.")
+                    st.error("최少 하나 이상의 도구를 입력해주세요.")
                 else:
-                    # 모든 도구에 대해 처리
                     success_tools = []
                     for tool_name, tool_config in parsed_tool.items():
-                        # URL 필드 확인 및 transport 설정
+                        # URL 존재 시 transport를 "sse"로 강제
                         if "url" in tool_config:
-                            # URL이 있는 경우 transport를 "sse"로 설정
                             tool_config["transport"] = "sse"
-                            st.info(
-                                f"'{tool_name}' 도구에 URL이 감지되어 transport를 'sse'로 설정했습니다."
-                            )
+                            st.info(f"'{tool_name}' 도구에 URL이 있어 transport를 'sse'로 설정했습니다.")
                         elif "transport" not in tool_config:
-                            # URL이 없고 transport도 없는 경우 기본값 "stdio" 설정
-                            tool_config["transport"] = "stdio"
-
-                        # 필수 필드 확인
+                            tool_config["transport"] = "stdio"  # transport 누락 시 기본 "stdio"
+                        # 필수 필드 검증
                         if "command" not in tool_config and "url" not in tool_config:
-                            st.error(
-                                f"'{tool_name}' 도구 설정에는 'command' 또는 'url' 필드가 필요합니다."
-                            )
+                            st.error(f"'{tool_name}' 설정에 'command' 또는 'url' 필드가 필요합니다.")
                         elif "command" in tool_config and "args" not in tool_config:
-                            st.error(
-                                f"'{tool_name}' 도구 설정에는 'args' 필드가 필요합니다."
-                            )
-                        elif "command" in tool_config and not isinstance(
-                            tool_config["args"], list
-                        ):
-                            st.error(
-                                f"'{tool_name}' 도구의 'args' 필드는 반드시 배열([]) 형식이어야 합니다."
-                            )
+                            st.error(f"'{tool_name}' 설정에 'args' 필드가 필요합니다.")
+                        elif "command" in tool_config and not isinstance(tool_config["args"], list):
+                            st.error(f"'{tool_name}'의 'args'는 리스트 형식이어야 합니다.")
                         else:
-                            # pending_mcp_config에 도구 추가
+                            # pending 설정에 도구 추가
                             st.session_state.pending_mcp_config[tool_name] = tool_config
                             success_tools.append(tool_name)
-
-                    # 성공 메시지
+                    # 추가 성공 알림
                     if success_tools:
                         if len(success_tools) == 1:
-                            st.success(
-                                f"{success_tools[0]} 도구가 추가되었습니다. 적용하려면 '적용하기' 버튼을 눌러주세요."
-                            )
+                            st.success(f"{success_tools[0]} 도구가 추가되었습니다. 적용하려면 '도구 설정 적용' 버튼을 눌러주세요.")
                         else:
-                            tool_names = ", ".join(success_tools)
-                            st.success(
-                                f"총 {len(success_tools)}개 도구({tool_names})가 추가되었습니다. 적용하려면 '적용하기' 버튼을 눌러주세요."
-                            )
+                            tool_list = ", ".join(success_tools)
+                            st.success(f"총 {len(success_tools)}개 도구({tool_list})가 추가되었습니다. 적용하려면 '도구 설정 적용' 버튼을 눌러주세요.")
         except json.JSONDecodeError as e:
-            error_msg = f"JSON 파싱 에러: JSON 형식이 올바르지 않습니다. (오류 위치: 줄 {getattr(e, 'lineno', '?')}, 열 {getattr(e, 'colno', '?')})"
-            st.error(error_msg)
+            st.error(f"JSON 파싱 에러: {e}")
             st.markdown(
                 """
-            **수정 방법**:
-            1. JSON 형식이 올바른지 확인하세요.
-            2. 모든 키는 큰따옴표(")로 감싸야 합니다.
-            3. 문자열 값도 큰따옴표(")로 감싸야 합니다.
-            4. 문자열 내에서 큰따옴표를 사용할 경우 이스케이프(\\")해야 합니다.
+            **수정 방법**:  
+            1. JSON 형식이 올바른지 확인하세요.  
+            2. 모든 키와 문자열 값을 큰따옴표(")로 감싸야 합니다.  
+            3. 문자열 내에 큰따옴표를 포함해야 한다면 `\"`처럼 이스케이프 처리를 해야 합니다.
             """
             )
         except Exception as e:
             st.error(f"오류 발생: {e}")
 
-    # 구분선 추가
     st.divider()
-
-    # 현재 설정된 도구 설정 표시 (읽기 전용)
     st.subheader("현재 도구 설정 (읽기 전용)")
-    st.code(
-        json.dumps(st.session_state.pending_mcp_config, indent=2, ensure_ascii=False)
-    )
+    st.code(json.dumps(st.session_state.pending_mcp_config, indent=2, ensure_ascii=False))
 
-# --- 등록된 도구 목록 표시 및 삭제 버튼 추가 ---
+# --- 등록된 도구 목록 및 삭제 ---
 with st.sidebar.expander("등록된 도구 목록", expanded=True):
     try:
         pending_config = st.session_state.pending_mcp_config
-    except Exception as e:
+    except Exception:
         st.error("유효한 MCP 도구 설정이 아닙니다.")
     else:
-        # pending config의 키(도구 이름) 목록을 순회하며 표시
         for tool_name in list(pending_config.keys()):
             col1, col2 = st.columns([8, 2])
             col1.markdown(f"- **{tool_name}**")
             if col2.button("삭제", key=f"delete_{tool_name}"):
-                # pending config에서 해당 도구 삭제 (즉시 적용되지는 않음)
                 del st.session_state.pending_mcp_config[tool_name]
-                st.success(
-                    f"{tool_name} 도구가 삭제되었습니다. 적용하려면 '적용하기' 버튼을 눌러주세요."
-                )
+                st.success(f"{tool_name} 도구가 삭제되었습니다. 적용하려면 '도구 설정 적용' 버튼을 눌러주세요.")
 
 with st.sidebar:
-    # 적용하기 버튼: pending config를 실제 설정에 반영하고 세션 재초기화
-    st.subheader("MCP 도구 적용")
-    if st.button(
-        "도구설정 적용하기",
-        key="apply_button",
-        type="primary",
-        use_container_width=True,
-    ):
-        # 변경사항 적용 전에, '도구 추가' 버튼을 누르지 않고 입력된 JSON이 있을 경우 처리
-        try:
-            current_config = json.loads(st.session_state.get("mcp_config_text", "{}"))
-        except Exception:
-            current_config = {}
-        if st.session_state.pending_mcp_config == current_config:
-            if new_tool_json.strip():
-                try:
-                    parsed_tool = json.loads(new_tool_json)
-                except json.JSONDecodeError as e:
-                    error_msg = f"JSON 파싱 에러: JSON 형식이 올바르지 않습니다. (오류 위치: 줄 {getattr(e, 'lineno', '?')}, 열 {getattr(e, 'colno', '?')})"
-                    st.error(error_msg)
-                    st.markdown("""
-                    **수정 방법**:
-                    1. JSON 형식이 올바른지 확인하세요.
-                    2. 모든 키는 큰따옴표(")로 감싸야 합니다.
-                    3. 문자열 값도 큰따옴표(")로 감싸야 합니다.
-                    4. 문자열 내에서 큰따옴표를 사용할 경우 이스케이프(\\")해야 합니다.
-                    """)
-                    st.stop()
-                if "mcpServers" in parsed_tool:
-                    parsed_tool = parsed_tool["mcpServers"]
-                    st.info("'mcpServers' 형식이 감지되었습니다. 자동으로 변환합니다.")
-                if len(parsed_tool) == 0:
-                    st.error("최소 하나 이상의 도구를 입력해주세요.")
-                    st.stop()
-                for tool_name, tool_config in parsed_tool.items():
-                    if "url" in tool_config:
-                        tool_config["transport"] = "sse"
-                        st.info(f"'{tool_name}' 도구에 URL이 감지되어 transport를 'sse'로 설정했습니다.")
-                    elif "transport" not in tool_config:
-                        tool_config["transport"] = "stdio"
-                    if "command" not in tool_config and "url" not in tool_config:
-                        st.error(f"'{tool_name}' 도구 설정에는 'command' 또는 'url' 필드가 필요합니다.")
-                        st.stop()
-                    elif "command" in tool_config and "args" not in tool_config:
-                        st.error(f"'{tool_name}' 도구 설정에는 'args' 필드가 필요합니다.")
-                        st.stop()
-                    elif "command" in tool_config and not isinstance(tool_config["args"], list):
-                        st.error(f"'{tool_name}' 도구의 'args' 필드는 반드시 배열([]) 형식이어야 합니다.")
-                        st.stop()
-                    else:
-                        st.session_state.pending_mcp_config[tool_name] = tool_config
-                st.info("입력된 JSON이 임시 도구 설정에 반영되었습니다. '도구설정 적용하기'를 계속 진행합니다.")
-        # 적용 중 메시지 표시
+    # "도구 설정 적용" 버튼: pending 설정을 실제 반영하여 재초기화
+    if st.button("도구 설정 적용", key="apply_button", type="primary", use_container_width=True):
         apply_status = st.empty()
         with apply_status.container():
             st.warning("🔄 변경사항을 적용하고 있습니다. 잠시만 기다려주세요...")
             progress_bar = st.progress(0)
-
-            # 설정 저장
-            st.session_state.mcp_config_text = json.dumps(
-                st.session_state.pending_mcp_config, indent=2, ensure_ascii=False
-            )
-
-            # 세션 초기화 준비
+            # 새로운 설정을 세션 상태에 저장
+            st.session_state.mcp_config_text = json.dumps(st.session_state.pending_mcp_config, indent=2, ensure_ascii=False)
+            # 세션 재초기화 플래그 설정
             st.session_state.session_initialized = False
             st.session_state.agent = None
-
-            # 진행 상태 업데이트
             progress_bar.progress(30)
-
-            # 초기화 실행
-            success = st.session_state.event_loop.run_until_complete(
-                initialize_session(st.session_state.pending_mcp_config)
-            )
-
-            # 진행 상태 업데이트
+            # 에이전트 재생성
+            success = st.session_state.event_loop.run_until_complete(initialize_session(st.session_state.pending_mcp_config))
             progress_bar.progress(100)
-
             if success:
                 st.success("✅ 새로운 MCP 도구 설정이 적용되었습니다.")
             else:
                 st.error("❌ 새로운 MCP 도구 설정 적용에 실패하였습니다.")
+        st.rerun()  # 페이지 재실행
 
-        # 페이지 새로고침
-        st.rerun()
-
-# --- 기본 세션 초기화 (초기화되지 않은 경우) ---
+# --- 초기 세션 자동 초기화 ---
 if not st.session_state.session_initialized:
     st.info("🔄 MCP 서버와 에이전트를 초기화합니다. 잠시만 기다려주세요...")
-    success = st.session_state.event_loop.run_until_complete(initialize_session(st.session_state.pending_mcp_config))
+    success = st.session_state.event_loop.run_until_complete(initialize_session())
     if success:
-        st.success(
-            f"✅ 초기화 완료! {st.session_state.tool_count}개의 도구가 로드되었습니다."
-        )
+        st.success(f"✅ 초기화 완료! {st.session_state.tool_count}개의 도구가 로드되었습니다.")
     else:
-        st.error("❌ 초기화에 실패했습니다. 페이지를 새로고침해 주세요.")
+        # 모델 미지원으로 실패한 경우와 기타 오류 구분
+        if st.session_state.get("model_choice") not in ["claude 3.7sonnet", "gpt-4o"]:
+            st.error("❌ 선택한 LLM 모델은 현재 지원될 수 없습니다. 지원되는 모델로 변경해주세요.")
+        else:
+            st.error("❌ 초기화에 실패했습니다. 페이지를 새로고침해 주세요.")
 
 # --- 대화 기록 출력 ---
 print_message()
 
-# --- 사용자 입력 및 처리 ---
+# --- 사용자 입력 처리 ---
 user_query = st.chat_input("💬 질문을 입력하세요")
 if user_query:
     if st.session_state.session_initialized:
@@ -536,74 +393,15 @@ if user_query:
         with st.chat_message("assistant"):
             tool_placeholder = st.empty()
             text_placeholder = st.empty()
-            resp, final_text, final_tool = (
-                st.session_state.event_loop.run_until_complete(
-                    process_query(
-                        user_query,
-                        text_placeholder,
-                        tool_placeholder,
-                        st.session_state.timeout_seconds,
-                    )
-                )
+            # 비동기 에이전트 응답 생성
+            resp, final_text, final_tool = st.session_state.event_loop.run_until_complete(
+                process_query(user_query, text_placeholder, tool_placeholder, st.session_state.timeout_seconds)
             )
-        if "error" in resp:
-            st.error(resp["error"])
-        else:
-            st.session_state.history.append({"role": "user", "content": user_query})
-            st.session_state.history.append(
-                {"role": "assistant", "content": final_text}
-            )
-            if final_tool.strip():
-                st.session_state.history.append(
-                    {"role": "assistant_tool", "content": final_tool}
-                )
-            st.rerun()
+            # 에러 발생 시 에러 메시지 표시
+            if isinstance(resp, dict) and resp.get("error"):
+                st.markdown(final_text)
+            else:
+                # 최종 응답 출력
+                st.markdown(final_text)
     else:
-        st.warning("⏳ 시스템이 아직 초기화 중입니다. 잠시 후 다시 시도해주세요.")
-
-# --- 사이드바: 시스템 정보 및 LLM 모델 선택 ---
-with st.sidebar:
-    st.subheader("🔧 시스템 정보 및 LLM 모델 선택")
-    st.write(f"🛠️ MCP 도구 수: {st.session_state.get('tool_count', '초기화 중...')}")
-    model_options = [
-        "Claude 3.7 Sonnet",
-        "GPT-4o (OpenAI)",
-        "Gemini 2.0",
-        "Grok 3",
-        "Llama 3.3",
-        "Phoenix 1.0",
-    ]
-    if "selected_model" not in st.session_state:
-        st.session_state.selected_model = model_options[0]
-    st.selectbox(
-        "🧠 LLM 모델 선택",
-        model_options,
-        index=model_options.index(st.session_state.selected_model) if "selected_model" in st.session_state else 0,
-        key="selected_model",
-    )
-    # 모델 선택 변경 시 에이전트 재초기화
-    if st.session_state.session_initialized and "model_in_use" in st.session_state and st.session_state.selected_model != st.session_state.model_in_use:
-        st.session_state.session_initialized = False
-        st.session_state.agent = None
-        st.experimental_rerun()
-    st.subheader("⏱️ 타임아웃 설정")
-    st.session_state.timeout_seconds = st.slider(
-        "응답 생성 제한 시간(초)",
-        min_value=60,
-        max_value=300,
-        value=st.session_state.timeout_seconds,
-        step=10,
-        help="에이전트가 응답을 생성하는 최대 시간을 설정합니다. 복잡한 작업은 더 긴 시간이 필요할 수 있습니다.",
-    )
-    # 구분선 추가 (시각적 분리)
-    st.divider()
-    # 사이드바 최하단에 대화 초기화 버튼 추가
-    if st.button("🔄 대화 초기화", use_container_width=True, type="primary"):
-        # thread_id 초기화
-        st.session_state.thread_id = random_uuid()
-        # 대화 히스토리 초기화
-        st.session_state.history = []
-        # 알림 메시지
-        st.success("✅ 대화가 초기화되었습니다.")
-        # 페이지 새로고침
-        st.rerun()
+        st.error("🚫 에이전트가 초기화되지 않았습니다. 좌측에서 설정을 확인하고 다시 시도하세요.")
